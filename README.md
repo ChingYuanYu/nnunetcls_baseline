@@ -38,7 +38,7 @@ nnUNetCLS relies on **nnUNet’s preprocessing pipeline** to standardize image s
 ### 1. Required Data Structure  
 
 Your dataset must follow the **nnUNet folder convention**:  
-
+```bash
 nnUNet_raw/
 └── Dataset<DATASET_ID>_<DATASET_NAME>/
 ├── imagesTr/ # Training images (NIfTI format)
@@ -52,7 +52,7 @@ nnUNet_raw/
 │ ├── TestID_0000.nii.gz
 │ └── ...
 └── dataset.json # Dataset description file
-
+```
 
 **Notes:**  
 - Each modality is indexed as `_0000`, `_0001`, etc.  
