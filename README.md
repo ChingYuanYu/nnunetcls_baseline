@@ -87,7 +87,7 @@ python generate_cls_data.py \
 
 **Arguments:**
 - `--input_path, -i`: Path to CSV/Excel file containing clinical and imaging information
-- `--output_path, -o`: Directory to save classification data and splits
+- `--output_path, -o`: Directory to save classification data and splits -> "/path/to/your/nnUNet_preprocessed" 
 - `--identifier_column, -id`: Column name for patient identifiers (default: 'patient_id')
 - `--label_column, -label`: Column name for classification labels (default: 'label')
 
