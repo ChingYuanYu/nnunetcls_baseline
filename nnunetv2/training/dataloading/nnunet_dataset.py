@@ -1,5 +1,6 @@
 import os
 import warnings
+import pandas as pd
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from functools import lru_cache
@@ -14,6 +15,7 @@ from batchgenerators.utilities.file_and_folder_operations import join, load_pick
 from nnunetv2.configuration import default_num_processes
 from nnunetv2.training.dataloading.utils import unpack_dataset
 import math
+from sklearn.utils.class_weight import compute_class_weight
 
 
 class nnUNetBaseDataset(ABC):
@@ -296,6 +298,43 @@ class nnUNetDatasetBlosc2(nnUNetBaseDataset):
 
         # print(image_size, chunk_size, block_size)
         return tuple(block_size), tuple(chunk_size)
+
+def get_class_weights(df):
+    classes = df['label'].unique()
+    weights = compute_class_weight(class_weight='balanced', classes=classes, y=df['label'])
+    return weights
+
+class nnUNetDatasetBlosc2CLS(nnUNetDatasetBlosc2):
+    def __init__(self, folder: str, identifiers: List[str] = None,
+                 folder_with_segs_from_previous_stage: str = None):
+        super().__init__(folder, identifiers, folder_with_segs_from_previous_stage)
+        blosc2.set_nthreads(1)
+        self.dataframe = pd.read_csv(join(self.source_folder, os.pardir, 'cls_data.csv'))
+        self.class_weights = get_class_weights(self.dataframe)
+
+    def load_case(self, identifier):
+        dparams = {
+            'nthreads': 1
+        }
+        data_b2nd_file = join(self.source_folder, identifier + '.b2nd')
+        cls_label = self.dataframe[self.dataframe['identifier'] == identifier]['label'].values[0]
+
+        # mmap does not work with Windows -> https://github.com/MIC-DKFZ/nnUNet/issues/2723
+        mmap_kwargs = {} if os.name == "nt" else {'mmap_mode': 'r'}
+        data = blosc2.open(urlpath=data_b2nd_file, mode='r', dparams=dparams, **mmap_kwargs)
+
+        seg_b2nd_file = join(self.source_folder, identifier + '_seg.b2nd')
+        seg = blosc2.open(urlpath=seg_b2nd_file, mode='r', dparams=dparams, **mmap_kwargs)
+
+        if self.folder_with_segs_from_previous_stage is not None:
+            prev_seg_b2nd_file = join(self.folder_with_segs_from_previous_stage, identifier + '.b2nd')
+            seg_prev = blosc2.open(urlpath=prev_seg_b2nd_file, mode='r', dparams=dparams, **mmap_kwargs)
+        else:
+            seg_prev = None
+
+        properties = load_pickle(join(self.source_folder, identifier + '.pkl'))
+        return data, seg, seg_prev, properties, cls_label
+
 
 
 file_ending_dataset_mapping = {

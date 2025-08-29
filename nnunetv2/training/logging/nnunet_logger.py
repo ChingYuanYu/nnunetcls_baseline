@@ -21,6 +21,10 @@ class nnUNetLogger(object):
             'dice_per_class_or_region': list(),
             'train_losses': list(),
             'val_losses': list(),
+            'train_cls_losses': list(),
+            'val_cls_losses': list(),
+            'val_classification_accuracy': list(),
+            'val_auc': list(),
             'lrs': list(),
             'epoch_start_timestamps': list(),
             'epoch_end_timestamps': list()

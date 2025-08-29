@@ -9,8 +9,9 @@ from batchgenerators.utilities.file_and_folder_operations import join, load_json
 from threadpoolctl import threadpool_limits
 
 from nnunetv2.paths import nnUNet_preprocessed
+from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetBaseDataset
-from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetBlosc2
+from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetBlosc2, nnUNetDatasetBlosc2CLS
 from nnunetv2.utilities.label_handling.label_handling import LabelManager
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
@@ -218,11 +219,211 @@ class nnUNetDataLoader(DataLoader):
         return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
 
 
+class nnUNetDataLoaderCLS(nnUNetDataLoader):
+    def determine_shapes(self):
+        # load one case
+        data, seg, seg_prev, properties, _ = self._data.load_case(self._data.identifiers[0])
+        num_color_channels = data.shape[0]
+
+        data_shape = (self.batch_size, num_color_channels, *self.patch_size)
+        channels_seg = seg.shape[0]
+        if seg_prev is not None:
+            channels_seg += 1
+        seg_shape = (self.batch_size, channels_seg, *self.patch_size)
+        return data_shape, seg_shape
+    def generate_train_batch(self):
+        selected_keys = self.get_indices()
+        # preallocate memory for data and seg
+        data_all = np.zeros(self.data_shape, dtype=np.float32)
+        seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+        cls_label_all = np.zeros(self.batch_size, dtype=np.int16)
+
+        for j, i in enumerate(selected_keys):
+            # oversampling foreground will improve stability of model training, especially if many patches are empty
+            # (Lung for example)
+            force_fg = self.get_do_oversample(j)
+
+            data, seg, seg_prev, properties, cls_label = self._data.load_case(i)
+
+            # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
+            # self._data.load_case(i) (see nnUNetDataset.load_case)
+            shape = data.shape[1:]
+
+            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
+            bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
+
+            # use ACVL utils for that. Cleaner.
+            data_all[j] = crop_and_pad_nd(data, bbox, 0)
+
+            seg_cropped = crop_and_pad_nd(seg, bbox, -1)
+            if seg_prev is not None:
+                seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
+            seg_all[j] = seg_cropped
+            cls_label_all[j] = cls_label
+        if self.patch_size_was_2d:
+            data_all = data_all[:, :, 0]
+            seg_all = seg_all[:, :, 0]
+        cls_label_all = torch.from_numpy(cls_label_all).to(torch.int16)
+        if self.transforms is not None:
+            with torch.no_grad():
+                with threadpool_limits(limits=1, user_api=None):
+                    data_all = torch.from_numpy(data_all).float()
+                    seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                    images = []
+                    segs = []
+                    for b in range(self.batch_size):
+                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
+                        images.append(tmp['image'])
+                        segs.append(tmp['segmentation'])
+                    data_all = torch.stack(images)
+                    if isinstance(segs[0], list):
+                        seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
+                    else:
+                        seg_all = torch.stack(segs)
+                    del segs, images
+            return {'data': data_all, 'target': seg_all, 'cls_label': cls_label_all, 'keys': selected_keys}
+
+        return {'data': data_all, 'target': seg_all, 'cls_label': cls_label_all, 'keys': selected_keys}
+
+def class_to_indices(cls_dataframe, identifiers):
+    """
+    Converts a DataFrame with class labels into a dictionary mapping class labels to their indices.
+    :param cls_dataframe: DataFrame containing 'identifier' and 'label' columns.
+    :return: Dictionary mapping class labels to lists of indices.
+    """
+    class_to_indices = {}
+    for identifier in identifiers:
+        # Filter the DataFrame for the current identifier
+        filtered_df = cls_dataframe[cls_dataframe['identifier'] == identifier]
+        if not filtered_df.empty:
+            # Get the class label for this identifier
+            cls_label = filtered_df['label'].values[0].astype(int)
+            if cls_label not in class_to_indices:
+                class_to_indices[cls_label] = []
+            class_to_indices[cls_label].append(identifier)
+    return class_to_indices
+
+class nnUNetDataBalancedLoaderCLS(nnUNetDataLoaderCLS):
+    """
+    This dataloader is used to balance the classes in the batch. It will sample patches from all classes
+    in the batch.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.class_weights = self._data.class_weights
+        self.class_to_indices = class_to_indices(self._data.dataframe, self._data.identifiers)
+
+    def get_balanced_indices(self):
+        classes = list(self.class_to_indices.keys())
+
+        # Step 1: Ensure each class is sampled at least once
+        batch_indices = []
+        for cls in classes:
+            indices = self.class_to_indices[cls]
+            if indices:  # avoid empty class
+                batch_indices.append(np.random.choice(indices))
+
+        remaining = self.batch_size - len(batch_indices)
+        if remaining < 0:
+            raise ValueError("Batch size must be >= number of classes")
+
+        # Step 2: Weighted sampling from all remaining indices
+        weights = np.array([self.class_weights[cls] for cls in classes])
+        weights = weights / weights.sum()
+        # Determine how many samples per class
+        class_sample_counts = np.random.multinomial(remaining, weights)
+        # Sample from each class
+        for cls, n_samples in zip(classes, class_sample_counts):
+            indices = self.class_to_indices[cls]
+            if not indices:
+                continue
+            replace = n_samples > len(indices)
+            selected = np.random.choice(indices, size=n_samples, replace=replace)
+            batch_indices.extend(selected.tolist())
+
+        np.random.shuffle(batch_indices)
+        return batch_indices
+
+    def generate_train_batch(self):
+        selected_keys = self.get_balanced_indices()
+        # preallocate memory for data and seg
+        data_all = np.zeros(self.data_shape, dtype=np.float32)
+        seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+        cls_label_all = np.zeros(self.batch_size, dtype=np.int16)
+
+        for j, i in enumerate(selected_keys):
+            # oversampling foreground will improve stability of model training, especially if many patches are empty
+            # (Lung for example)
+            force_fg = self.get_do_oversample(j)
+
+            data, seg, seg_prev, properties, cls_label = self._data.load_case(i)
+
+            # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
+            # self._data.load_case(i) (see nnUNetDataset.load_case)
+            shape = data.shape[1:]
+
+            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
+            bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
+
+            # use ACVL utils for that. Cleaner.
+            data_all[j] = crop_and_pad_nd(data, bbox, 0)
+
+            seg_cropped = crop_and_pad_nd(seg, bbox, -1)
+            if seg_prev is not None:
+                seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
+            seg_all[j] = seg_cropped
+            cls_label_all[j] = cls_label
+        if self.patch_size_was_2d:
+            data_all = data_all[:, :, 0]
+            seg_all = seg_all[:, :, 0]
+        cls_label_all = torch.from_numpy(cls_label_all).to(torch.int16)
+        if self.transforms is not None:
+            with torch.no_grad():
+                with threadpool_limits(limits=1, user_api=None):
+                    data_all = torch.from_numpy(data_all).float()
+                    seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                    images = []
+                    segs = []
+                    for b in range(self.batch_size):
+                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
+                        images.append(tmp['image'])
+                        segs.append(tmp['segmentation'])
+                    data_all = torch.stack(images)
+                    if isinstance(segs[0], list):
+                        seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
+                    else:
+                        seg_all = torch.stack(segs)
+                    del segs, images
+            return {'data': data_all, 'target': seg_all, 'cls_label': cls_label_all, 'keys': selected_keys}
+
+        return {'data': data_all, 'target': seg_all, 'cls_label': cls_label_all, 'keys': selected_keys}
+
+        
+
+
+
 if __name__ == '__main__':
-    folder = join(nnUNet_preprocessed, 'Dataset002_Heart', 'nnUNetPlans_3d_fullres')
-    ds = nnUNetDatasetBlosc2(folder)  # this should not load the properties!
+    import json
+    with open (join(nnUNet_preprocessed, 'Dataset723_hecktor25', 'splits_final.json'), 'r') as f:
+        splits = json.load(f)
+    folder = join(nnUNet_preprocessed, 'Dataset723_hecktor25', 'nnUNetPlans_3d_fullres')
+    val_keys = splits[1]['val']
+    allowed_num_processes = 12
+    ds = nnUNetDatasetBlosc2CLS(folder, val_keys)  # this should not load the properties!
     pm = PlansManager(join(folder, os.pardir, 'nnUNetPlans.json'))
     lm = pm.get_label_manager(load_json(join(folder, os.pardir, 'dataset.json')))
-    dl = nnUNetDataLoader(ds, 5, (16, 16, 16), (16, 16, 16), lm,
+    dl = nnUNetDataBalancedLoaderCLS(ds, 8, (16, 16, 16), (16, 16, 16), lm,
                           0.33, None, None)
-    a = next(dl)
+    mt_gen_val = NonDetMultiThreadedAugmenter(data_loader=dl,
+                                                      transform=None, num_processes=max(1, allowed_num_processes // 2),
+                                                      num_cached=max(3, allowed_num_processes // 4), seeds=None,
+                                                      pin_memory=True,
+                                                      wait_time=0.002)
+    keys = []
+    for i in range(len(val_keys)// 2):
+        batch = next(mt_gen_val)
+        keys.extend(batch['keys'])
+    
+    print('overlap:', len(set(keys).intersection(set(val_keys))))
+    print('cover percentage:', len(set(keys).intersection(set(val_keys))) / len(val_keys) * 100)
+    
