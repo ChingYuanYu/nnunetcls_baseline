@@ -53,7 +53,7 @@ from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
 from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class, nnUNetDatasetBlosc2CLS
-from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader, nnUNetDataBalancedLoaderCLS
+from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader, nnUNetDataLoaderCLS, nnUNetDataBalancedLoaderCLS
 from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
@@ -90,33 +90,6 @@ class FocalBCEWithLogitsLoss(nn.Module):
         focal_loss = focal_weight * bce_loss
         return focal_loss.mean() if self.reduction == 'mean' else focal_loss.sum()
 
-class FocalCEWithLogitsLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
-        super(FocalCEWithLogitsLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-        self.ce_loss = nn.CrossEntropyLoss(reduction=reduction)
-    def forward(self, logits, targets):
-        ce_loss = self.ce_loss(logits, targets)
-        # Get probabilities
-        log_probs = F.log_softmax(logits, dim=1)
-        probs = torch.exp(log_probs)
-        targets_one_hot = F.one_hot(targets, num_classes=logits.size(1)).float()
-
-        focal_term = (1 - probs) ** self.gamma
-        focal_loss = -self.alpha * focal_term * log_probs
-        loss = torch.sum(targets_one_hot * focal_loss, dim=1)
-
-        if self.reduction == 'mean':
-            focal_loss = loss.mean()
-        elif self.reduction == 'sum':
-            focal_loss = loss.sum()
-        else:
-            focal_loss = loss  # no reduction
-
-        # Combine focal and CE
-        return focal_loss
     
 class DynamicClassificationLoss(nn.Module):
     def __init__(self, class_num=2, imbalanced=False):
@@ -433,18 +406,18 @@ class MedNeXtClassifier(nn.Module):
         
         return output
 
-class nnUNetCLSTrainer(nnUNetTrainer):
+class nnUNetREGTrainer(nnUNetTrainer):
     def initialize(self):
         if not self.was_initialized:
             ## DDP batch size and oversampling can differ between workers and needs adaptation
             # we need to change the batch size in DDP because we don't use any of those distributed samplers
             self._set_batch_size_and_oversample()
-            self._best_acc = None
+            self._best_mae = None
             self.enable_deep_supervision = False
             self.num_input_channels = determine_num_input_channels(self.plans_manager, self.configuration_manager,
                                                                    self.dataset_json)
 
-            self.cls_class_num = self.get_cls_class_num(join(self.preprocessed_dataset_folder, os.pardir, 'cls_data.csv'))
+            self.cls_class_num = 1
             cls_head_output = self.cls_class_num if self.cls_class_num > 2 else 1
             self.network = self.build_network_architecture(
                 self.configuration_manager.network_arch_class_name,
@@ -471,7 +444,7 @@ class nnUNetCLSTrainer(nnUNetTrainer):
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
             self.dataset_name = self.preprocessed_dataset_folder.split('/')[-2]
             wandb.init(
-                project=f"cvpr26_{self.dataset_name}",
+                project=f"REG_{self.dataset_name}",
                 name=f"{self.__class__.__name__}_fold{self.fold}",
             )
 
@@ -491,15 +464,9 @@ class nnUNetCLSTrainer(nnUNetTrainer):
 
         return df['label'].nunique()
     
-    def _build_classification_loss(self, class_weights):
-        imbalanced = False
-        if class_weights.max() // class_weights.min() >= 10:
-            imbalanced = True
-            self.print_to_log_file("Imbalanced classes detected. Using Focal Loss.")
-        loss = DynamicClassificationLoss(
-            class_num=self.cls_class_num,
-            imbalanced=imbalanced
-        )
+    def _build_regression_loss(self):
+
+        loss = nn.MSELoss()
         return loss
 
     @staticmethod
@@ -578,16 +545,16 @@ class nnUNetCLSTrainer(nnUNetTrainer):
 
         dataset_tr, dataset_val = self.get_tr_and_val_datasets()
 
-        self.classification_loss = self._build_classification_loss(dataset_tr.class_weights)
+        self.regression_loss = self._build_regression_loss()
 
-        dl_tr = nnUNetDataBalancedLoaderCLS(dataset_tr, self.batch_size,
+        dl_tr = nnUNetDataLoaderCLS(dataset_tr, self.batch_size,
                                  initial_patch_size,
                                  self.configuration_manager.patch_size,
                                  self.label_manager,
                                  oversample_foreground_percent=self.oversample_foreground_percent,
                                  sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
                                  probabilistic_oversampling=self.probabilistic_oversampling)
-        dl_val = nnUNetDataBalancedLoaderCLS(dataset_val, self.batch_size,
+        dl_val = nnUNetDataLoaderCLS(dataset_val, self.batch_size,
                                   self.configuration_manager.patch_size,
                                   self.configuration_manager.patch_size,
                                   self.label_manager,
@@ -631,8 +598,8 @@ class nnUNetCLSTrainer(nnUNetTrainer):
             cls_output = self.network(data)
             # del data
             seg_loss = 0
-            cls_loss = self.classification_loss(cls_output, cls_label.unsqueeze(1).float())
-        l = cls_loss
+            reg_loss = self.regression_loss(cls_output, cls_label.unsqueeze(1).float())
+        l = reg_loss
 
 
         if self.grad_scaler is not None:
@@ -647,7 +614,7 @@ class nnUNetCLSTrainer(nnUNetTrainer):
             self.optimizer.step()
         return {'loss': l.detach().cpu().numpy(),
                 'seg_loss': seg_loss,
-                'cls_loss': cls_loss.detach().cpu().numpy()}
+                'reg_loss': reg_loss.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -658,19 +625,19 @@ class nnUNetCLSTrainer(nnUNetTrainer):
             cls_losses_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(losses_tr, outputs['loss'])
             dist.all_gather_object(seg_losses_tr, outputs['seg_loss'])
-            dist.all_gather_object(cls_losses_tr, outputs['cls_loss'])
+            dist.all_gather_object(cls_losses_tr, outputs['reg_loss'])
             loss_here = np.vstack(losses_tr).mean()
             seg_loss_here = np.vstack(seg_losses_tr).mean()
             cls_loss_here = np.vstack(cls_losses_tr).mean()
         else:
             loss_here = np.mean(outputs['loss'])
             seg_loss_here = np.mean(outputs['seg_loss'])
-            cls_loss_here = np.mean(outputs['cls_loss'])
+            cls_loss_here = np.mean(outputs['reg_loss'])
 
         self.logger.log('train_losses', loss_here, self.current_epoch)
         #self.seg_weight, self.cls_weight, slope = self.dynamic_loss_weight_updater.update(seg_loss_here)
         wandb.log({
-            'train_classification_loss': cls_loss_here,
+            'train_regression_loss': cls_loss_here,
             # 'seg_loss_slope': slope,
             # 'seg_weight': self.seg_weight,
             # 'cls_weight': self.cls_weight
@@ -699,24 +666,18 @@ class nnUNetCLSTrainer(nnUNetTrainer):
             cls_output = self.network(data)
             del data
             seg_loss = 0
-            cls_loss = self.classification_loss(cls_output, cls_label.unsqueeze(1).float())
-        l = cls_loss
+            reg_loss = self.regression_loss(cls_output, cls_label.unsqueeze(1).float())
+        l = reg_loss
         
         
-        if self.cls_class_num == 2:
-            class_probs = torch.sigmoid(cls_output)  # Assuming cls_output is logits
-            predicted_class = (class_probs > 0.5).float()  # Thresholding at 0.5 for binary classification
-        else:
-            class_probs = torch.softmax(cls_output, dim=1)
-            predicted_class = class_probs.argmax(dim=1)  # Get the class with the highest probability
-        all_probs.extend(class_probs.cpu().numpy())  # Move to CPU and convert to numpy
-        all_preds.extend(predicted_class.cpu().numpy())  # Move to CPU and convert to numpy
+        
+
+        all_preds.extend(cls_output.cpu().numpy())  # Move to CPU and convert to numpy
         all_labels.extend(cls_label.cpu().numpy())
         
 
 
         return {'total_loss': l.detach().cpu().numpy(),
-                'all_probs': all_probs,
                 'all_labels': all_labels,
                 'all_preds': all_preds,
                 'all_ids': all_ids
@@ -736,43 +697,33 @@ class nnUNetCLSTrainer(nnUNetTrainer):
             loss_here = np.mean(outputs_collated['total_loss'])
 
         all_preds = torch.tensor(np.array(outputs_collated['all_preds']))
-        all_probs = torch.tensor(np.array(outputs_collated['all_probs']))
         all_labels = torch.tensor(np.array(outputs_collated['all_labels']))
         all_ids = outputs_collated['all_ids']
 
-        if self.cls_class_num == 2:
-            auc_metric = metrics.roc_auc_score(all_labels, all_probs)
-            classification_accuracy = metrics.accuracy_score(all_labels, all_preds)
-            balanced_accuracy = metrics.balanced_accuracy_score(all_labels, all_preds)
-        else:
-            auc_metric = metrics.multiclass.roc_auc_score(all_labels, all_probs, multi_class='ovr')
-            classification_accuracy = metrics.accuracy_score(all_labels, all_preds)
-            balanced_accuracy = metrics.balanced_accuracy_score(all_labels, all_preds)
+        mae = nn.L1Loss()(all_preds, all_labels.float()).item()
+        mean_mae = np.mean(mae)
 
         wandb.log({
-            'val/classification_loss': loss_here,
-            "val/AUC": auc_metric,
-            "val/classification_accuracy": classification_accuracy,
-            "val/balanced_accuracy": balanced_accuracy
+            'val/MSE': loss_here,
+            "val/MAE": mean_mae,
         })
 
         self.epoch_df = pd.DataFrame({
             'ids': all_ids,
-            'probs': all_probs.cpu().numpy().tolist(),
+            'preds': all_preds.cpu().numpy().tolist(),
             'labels': all_labels.cpu().numpy().tolist(),
         })
 
         self.logger.log('val_losses', loss_here, self.current_epoch)
-        self.logger.log('val_classification_accuracy', classification_accuracy, self.current_epoch)
-        self.logger.log('val_auc', auc_metric, self.current_epoch)
+        self.logger.log('val_mae', mean_mae, self.current_epoch)
+
 
     def on_epoch_end(self):
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
         self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
         self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
-        self.print_to_log_file('val classification accuracy', np.round(self.logger.my_fantastic_logging['val_classification_accuracy'][-1], decimals=4))
-        self.print_to_log_file('val auc', np.round(self.logger.my_fantastic_logging['val_auc'][-1], decimals=4))
+        self.print_to_log_file('val_mae', np.round(self.logger.my_fantastic_logging['val_mae'][-1], decimals=4))
         self.print_to_log_file(
             f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
 
@@ -782,22 +733,22 @@ class nnUNetCLSTrainer(nnUNetTrainer):
             self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
 
         # handle 'best' checkpointing. ema_fg_dice is computed by the logger and can be accessed like this
-        if self._best_ema is None or self.logger.my_fantastic_logging['val_auc'][-1] > self._best_ema:
-            self._best_ema = self.logger.my_fantastic_logging['val_auc'][-1]
-            self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
-            self.save_checkpoint(join(self.output_folder, 'checkpoint_bestauc.pth'))
+        if self._best_ema is None or self.logger.my_fantastic_logging['val_losses'][-1] < self._best_ema:
+            self._best_ema = self.logger.my_fantastic_logging['val_losses'][-1]
+            self.print_to_log_file(f"Yayy! New best EMA MSE: {np.round(self._best_ema, decimals=4)}")
+            self.save_checkpoint(join(self.output_folder, 'checkpoint_bestmse.pth'))
         
-        if self._best_acc is None or self.logger.my_fantastic_logging['val_classification_accuracy'][-1] > self._best_acc:
-            self._best_acc = self.logger.my_fantastic_logging['val_classification_accuracy'][-1]
-            self.print_to_log_file(f"Yayy! New best classification accuracy: {np.round(self._best_acc, decimals=4)}")
-            self.save_checkpoint(join(self.output_folder, 'checkpoint_bestacc.pth'))
+        if self._best_mae is None or self.logger.my_fantastic_logging['val_mae'][-1] < self._best_mae:
+            self._best_mae = self.logger.my_fantastic_logging['val_mae'][-1]
+            self.print_to_log_file(f"Yayy! New best mae: {np.round(self._best_mae, decimals=4)}")
+            self.save_checkpoint(join(self.output_folder, 'checkpoint_bestmae.pth'))
 
         if self.local_rank == 0:
             self.logger.plot_progress_png(self.output_folder)
 
         self.current_epoch += 1
 
-class DenseNetTrainer(nnUNetCLSTrainer):
+class DenseNetREGTrainer(nnUNetREGTrainer):
 
     @staticmethod
     def build_network_architecture(architecture_class_name: str,
@@ -818,7 +769,7 @@ class DenseNetTrainer(nnUNetCLSTrainer):
             dropout_prob=0.2
         )
 
-class SEResNetTrainer(nnUNetCLSTrainer):
+class SEResNetREGTrainer(nnUNetREGTrainer):
 
     @staticmethod
     def build_network_architecture(architecture_class_name: str,
@@ -837,7 +788,7 @@ class SEResNetTrainer(nnUNetCLSTrainer):
             num_classes=cls_class_num
         )
 
-class ViTTrainer(nnUNetCLSTrainer):
+class ViTREGTrainer(nnUNetREGTrainer):
     @staticmethod
     def build_network_architecture(architecture_class_name: str,
                                    arch_init_kwargs: dict,
@@ -861,7 +812,7 @@ class ViTTrainer(nnUNetCLSTrainer):
             dropout_rate=0.1
         )
 
-class SwinViTTrainer(nnUNetCLSTrainer):
+class SwinViTREGTrainer(nnUNetREGTrainer):
 
     @staticmethod
     def build_network_architecture(architecture_class_name: str,
@@ -883,7 +834,7 @@ class SwinViTTrainer(nnUNetCLSTrainer):
             dropout_rate=0.1
         )
 
-class MedNeXtTrainer(nnUNetCLSTrainer):
+class MedNeXtREGTrainer(nnUNetREGTrainer):
 
     @staticmethod
     def build_network_architecture(architecture_class_name: str,

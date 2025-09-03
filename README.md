@@ -116,6 +116,12 @@ for baseline cls support
 - DenseNetTrainer
 - SEResNetTrainer
 - SwinViTTrainer
+- nnUNetREGTrainer
+- MedNeXtREGTrainer
+- ViTREGTrainer
+- DenseNetREGTrainer
+- SEResNetREGTrainer
+- SwinViTREGTrainer
 define in nnunetv2/training/nnUNetTrainer/nnUNetCLSTrainer.py
 
 ### 3. Inference

@@ -25,6 +25,7 @@ class nnUNetLogger(object):
             'val_cls_losses': list(),
             'val_classification_accuracy': list(),
             'val_auc': list(),
+            'val_mae': list(),
             'lrs': list(),
             'epoch_start_timestamps': list(),
             'epoch_end_timestamps': list()
