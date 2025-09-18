@@ -1,7 +1,7 @@
 from collections import OrderedDict
 from copy import deepcopy
 from typing import Union, Tuple, List
-
+import gc
 import numpy as np
 import pandas as pd
 import torch
@@ -9,6 +9,7 @@ from batchgenerators.augmentations.utils import resize_segmentation
 from scipy.ndimage import map_coordinates
 from skimage.transform import resize
 from nnunetv2.configuration import ANISO_THRESHOLD
+from nnunetv2.utilities.helpers import empty_cache
 
 
 def get_do_separate_z(spacing: Union[Tuple[float, ...], List[float], np.ndarray], anisotropy_threshold=ANISO_THRESHOLD):
@@ -194,6 +195,200 @@ def resample_data_or_seg(data: np.ndarray, new_shape: Union[Tuple[float, ...], L
     else:
         # print("no resampling necessary")
         return data
+
+def fast_resize_segmentation(segmentation, new_shape, mode="nearest"):
+    '''
+    Resizes a segmentation map. Supports all orders (see skimage documentation). Will transform segmentation map to one
+    hot encoding which is resized and transformed back to a segmentation map.
+    This prevents interpolation artifacts ([0, 0, 2] -> [0, 1, 2])
+    :param segmentation:
+    :param new_shape:
+    :param order:
+    :return:
+    '''
+    tpe = segmentation.dtype
+
+    if isinstance(segmentation, torch.Tensor):
+        assert len(segmentation.shape[2:]) == len(new_shape), f"segmentation.shape = {segmentation.shape}, new_shape = {new_shape}"
+    else:
+        assert len(segmentation.shape[1:]) == len(new_shape), f"segmentation.shape = {segmentation.shape}, new_shape = {new_shape}"
+        segmentation = torch.from_numpy(segmentation).unsqueeze(0).float()
+    #if order == 0:
+        #return resize(segmentation.astype(float), new_shape, order, mode="edge", clip=True, anti_aliasing=False).astype(tpe)
+    if mode == "nearest":
+        seg_torch = torch.nn.functional.interpolate(segmentation, new_shape, mode=mode)
+        reshaped = seg_torch
+    else:
+        #reshaped = np.zeros(new_shape, dtype=segmentation.dtype)
+        unique_labels = torch.unique(segmentation)
+        seg_torch = segmentation
+        reshaped = torch.zeros([*seg_torch.shape[:2], *new_shape], dtype=seg_torch.dtype, device=seg_torch.device)
+        for i, c in enumerate(unique_labels):
+            #mask = segmentation == c
+            #reshaped_multihot = resize(mask.astype(float), new_shape, order, mode="edge", clip=True, anti_aliasing=False)
+            mask = seg_torch == c
+            reshaped_multihot = torch.nn.functional.interpolate(mask.float(), new_shape, mode=mode, align_corners=False)
+            reshaped[reshaped_multihot >= 0.5] = c
+
+    return reshaped
+
+
+def fast_resample_data_or_seg_to_shape(data: Union[torch.Tensor, np.ndarray],
+                                  new_shape: Union[Tuple[int, ...], List[int], np.ndarray],
+                                  current_spacing: Union[Tuple[float, ...], List[float], np.ndarray],
+                                  new_spacing: Union[Tuple[float, ...], List[float], np.ndarray],
+                                  is_seg: bool = False,
+                                  order: int = 3, order_z: int = 0,
+                                  force_separate_z: Union[bool, None] = False,
+                                  separate_z_anisotropy_threshold: float = ANISO_THRESHOLD):
+
+    use_gpu = False
+    device = torch.device("cuda" if use_gpu else "cpu")
+    order_to_mode_map = {
+        0: "nearest",
+        1: "trilinear" if new_shape[0] > 1 else "bilinear",
+        2: "trilinear" if new_shape[0] > 1 else "bilinear",
+        3: "trilinear" if new_shape[0] > 1 else "bicubic",
+        4: "trilinear" if new_shape[0] > 1 else "bicubic",
+        5: "trilinear" if new_shape[0] > 1 else "bicubic",
+    }
+    
+    if is_seg:
+        #print(f"seg.shape: {data.shape}")
+        resize_fn = fast_resize_segmentation
+        kwargs = {
+            "mode": order_to_mode_map[order]
+        }
+    else:
+        #print(f"data.shape: {data.shape}")
+        resize_fn = torch.nn.functional.interpolate
+        kwargs = {
+            'mode': order_to_mode_map[order],
+            'align_corners': False
+        }
+    dtype_data = data.dtype
+    shape = np.array(data[0].shape)
+    new_shape = np.array(new_shape)
+    if np.any(shape != new_shape):
+        if not isinstance(data, torch.Tensor):
+            torch_data = torch.from_numpy(data).float()
+        else:
+            torch_data = data.float()
+        if new_shape[0] == 1:
+            torch_data = torch_data.transpose(1, 0)
+            new_shape = new_shape[1:]
+        else:
+            torch_data = torch_data.unsqueeze(0)
+        
+        torch_data = resize_fn(torch_data.to(device), tuple(new_shape), **kwargs)
+
+        if new_shape[0] == 1:
+            torch_data = torch_data.transpose(1, 0)
+        else:
+            torch_data = torch_data.squeeze(0)
+
+        if use_gpu:
+            torch_data = torch_data.cpu()
+        if isinstance(data, np.ndarray):
+            reshaped_final_data = torch_data.numpy().astype(dtype_data)
+        else:
+            reshaped_final_data = torch_data.to(dtype_data)
+        
+        #print(f"Reshaped data from {shape} to {new_shape}")
+        #print(f"reshaped_final_data shape: {reshaped_final_data.shape}")
+        assert reshaped_final_data.ndim == 4, f"reshaped_final_data.shape = {reshaped_final_data.shape}"
+        return reshaped_final_data
+    else:
+        print("no resampling necessary")
+        return data
+
+def logit_to_segment(predicted_logits):
+    max_logit, max_class = torch.max(predicted_logits, dim=0)
+                
+                # Apply threshold: Only assign the class if its logit exceeds the threshold
+    segmentation = torch.where(max_logit >= 0.5, max_class, torch.tensor(0, device=predicted_logits.device))
+    return segmentation
+
+def resize_by_chunk(torch_data, new_shape, chunk_size = 300):
+
+    torch_data = torch_data.detach().cpu()
+    torch.cuda.empty_cache()
+    step = new_shape[0] // chunk_size + 1
+    seg_old_spacing = np.zeros(new_shape)
+    z = torch_data.shape[2]
+    stride = int(z / step)
+    step1 = [i * stride for i in range(step)] + [z]
+    z = new_shape[0]
+    stride = int(z / step)
+    step2 = [i * stride for i in range(step)] + [z]
+    for i in range(step):
+        size = list(new_shape)
+        size[0] = step2[i + 1] - step2[i]
+        slicer = torch_data[:,:, step1[i]:step1[i + 1]]#.half()
+        slicer = torch.nn.functional.interpolate(slicer.cuda(), mode='trilinear', size=size, align_corners=True)[0]
+        seg_old_spacing[step2[i]:step2[i + 1]] = logit_to_segment(slicer).cpu()
+        del slicer
+        torch.cuda.empty_cache()
+
+    return torch.from_numpy(seg_old_spacing)
+
+def fast_resample_logit_to_shape(torch_data: Union[torch.Tensor, np.ndarray],
+                                  new_shape: Union[Tuple[int, ...], List[int], np.ndarray],
+                                  current_spacing: Union[Tuple[float, ...], List[float], np.ndarray],
+                                  new_spacing: Union[Tuple[float, ...], List[float], np.ndarray],
+                                  is_seg: bool = False,
+                                  order: int = 3, order_z: int = 0,
+                                  force_separate_z: Union[bool, None] = False,
+                                  separate_z_anisotropy_threshold: float = ANISO_THRESHOLD):
+    use_gpu = True
+    device = torch.device("cuda" if use_gpu else "cpu")
+    order_to_mode_map = {
+        0: "nearest",
+        1: "trilinear" if new_shape[0] > 1 else "bilinear",
+        2: "trilinear" if new_shape[0] > 1 else "bilinear",
+        3: "trilinear" if new_shape[0] > 1 else "bicubic",
+        4: "trilinear" if new_shape[0] > 1 else "bicubic",
+        5: "trilinear" if new_shape[0] > 1 else "bicubic",
+    }
+    
+
+    resize_fn = torch.nn.functional.interpolate
+    kwargs = {
+        'mode': order_to_mode_map[order],
+        'align_corners': False,
+    }
+    shape = np.array(torch_data[0].shape)
+    new_shape = np.array(new_shape)
+    if np.any(shape != new_shape):
+        
+        if new_shape[0] == 1:
+            torch_data = torch_data.transpose(1, 0)
+            new_shape = new_shape[1:]
+        else:
+            torch_data = torch_data.unsqueeze(0)
+        gc.collect()
+        empty_cache(device)
+        if new_shape[0] < 600:
+            torch_data = resize_fn(torch_data.to(device), tuple(new_shape), **kwargs)
+
+            if new_shape[0] == 1:
+                torch_data = torch_data.transpose(1, 0)
+            else:
+                torch_data = torch_data.squeeze(0)
+        else:
+            torch_data = resize_by_chunk(torch_data.to(device), tuple(new_shape))
+
+        
+
+        reshaped_final_data = torch_data
+
+
+        return reshaped_final_data
+    else:
+        print("no resampling necessary")
+        if new_shape[0] > 600:
+            torch_data = logit_to_segment(torch_data)
+        return torch_data
     
 
 if __name__ == '__main__':
